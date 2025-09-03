@@ -43,5 +43,25 @@ python upload.py test.jpg
 
 ---
 
+## Firmware Upgrade Rules (Simple Version)
+
+The uploader can also update the device firmware when needed.  
+Updates are done **automatically** based on these simple rules:
+
+- **Battery check**  
+  - If the battery is too low (15% or less), no update will run.
+
+- **When updates happen**  
+  - If the device firmware is out of date, the uploader will send the correct file:
+    - **BLE update** → `ble.bin`
+    - **ITE update** → `ite.bin`
+    - **BSP update** → `pixer.bin`
+
+That’s it — the tool will check and update when safe.  
+Users only need to prepare the firmware files in the same folder as the uploader.
+
+---
+
 ## Reference
 - [kasperis7/pixer](https://github.com/kasperis7/pixer)
+
