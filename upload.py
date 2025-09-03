@@ -211,57 +211,86 @@ def _fw_send(sock: socket.socket, data: bytes, recv_size: int = 64, retries: int
         return None
 
 def _fw_send_file(sock: socket.socket, path_on_device: str, stream: io.BufferedReader | io.BytesIO) -> bool:
+    MAX_SIZE = 1024 * 1024     # 534KB
+    CHUNK = 1024              # 與裝置端一致
+    T_START = 5.0             # 握手/回覆等待（秒）
+    T_XFER = 30.0             # 傳輸階段超時（秒/每次sendall）
+    T_OK_S = 180              # 等待 "OK!" 總秒數（每秒輪詢一次）
+
+    def _drain():
+        """清空殘留回應，避免下一命令失步""" 
+        try:
+            old = sock.gettimeout()
+            sock.settimeout(0.2)
+            while True:
+                try:
+                    if not sock.recv(256):
+                        break
+                except socket.timeout:
+                    break
+        finally:
+            try:
+                sock.settimeout(old)
+            except Exception:
+                pass
+
     try:
-        # 1) 啟動檔案傳輸
-        logger.debug("[FW] sendFile start")
-        resp = _fw_send(sock, b"sendFile")
-        logger.debug(f"[FW] sendFile init resp: {resp}")
-        if resp is None:
+        # 0) 計算大小並檢查上限
+        if isinstance(stream, io.BytesIO):
+            size = len(stream.getbuffer()); stream.seek(0)
+        else:
+            cur = stream.tell(); stream.seek(0, os.SEEK_END); size = stream.tell(); stream.seek(0)
+        if size > MAX_SIZE:
+            logger.error(f"[FW] file too large: {size} > {MAX_SIZE}")
             return False
 
-        # 2) 傳路徑
+        # 1) 啟動傳檔 + 路徑 + 檔長（握手階段用較短timeout）
+        sock.settimeout(T_START)
+        resp = _fw_send(sock, b"sendFile"); logger.debug(f"[FW] sendFile init resp: {resp}")
+        if not resp: return False
+
         sock.sendall(path_on_device.encode('utf-8'))
+        ack1 = _fw_send(sock, str(size).encode()); logger.debug(f"[FW] send size resp: {ack1}")
+        if not ack1: return False
 
-        # 3) 傳 size（使用可重置的 BytesIO 最準）
-        if isinstance(stream, io.BytesIO):
-            size = len(stream.getbuffer())
-            stream.seek(0)
-        else:
-            # 對一般檔案以檔案大小為準
-            cur = stream.tell()
-            stream.seek(0, os.SEEK_END)
-            size = stream.tell()
-            stream.seek(cur, os.SEEK_SET)
-        size_str = str(size).encode('utf-8')
-
-        resp2 = _fw_send(sock, size_str)
-        logger.debug(f"[FW] send size resp: {resp2}")
-
-        # 4) 分塊傳資料
+        # 2) 傳輸資料（傳輸階段用較長timeout）
+        old_to = sock.gettimeout()
+        sock.settimeout(T_XFER)
         sent = 0
-        chunk = stream.read(1024)
-        while chunk:
+        stream.seek(0)
+        while True:
+            chunk = stream.read(CHUNK)
+            if not chunk: break
             sock.sendall(chunk)
             sent += len(chunk)
-            chunk = stream.read(1024)
         logger.debug(f"[FW] sent bytes: {sent}")
 
-        # 5) 等最後 OK!
-        for i in range(30):
+        # 3) 等待最終 "OK!"（輪詢最多 T_OK_S 秒）
+        sock.settimeout(5.0)
+        for _ in range(T_OK_S):
             try:
                 r = sock.recv(256)
                 if r:
-                    msg = r.decode(errors='ignore')
+                    msg = r.decode(errors='ignore').strip()
                     logger.debug(f"[FW] last resp: {msg}")
-                    if msg.strip() == "OK!":
+                    if msg == "OK!":
                         return True
             except socket.timeout:
                 pass
-            time.sleep(1)
+            time.sleep(1.0)
+        logger.error("[FW] wait OK! timeout")
         return False
+
     except Exception as e:
         logger.error(f"[FW] send_file error: {e}")
         return False
+    finally:
+        _drain()                 # 清殘留，避免下一階段失步
+        try: sock.settimeout(None)
+        except Exception: pass
+        time.sleep(0.5)          # 給裝置一點處理時間
+
+
 
 def firmware_upgrade_before_check(
     host='192.168.1.1', port=6000,
